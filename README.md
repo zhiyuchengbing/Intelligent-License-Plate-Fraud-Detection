@@ -55,3 +55,108 @@
  - **结果更新**：覆盖写入默认 CSV（无疑似结果时也覆盖为空表头，避免旧结果残留）。
  - **状态更新**：`last_task_id` 使用本次参与检测数据的最大 `TASK_ID` 更新。
 
+ # 后端服务（Flask）
+
+ ## 服务入口
+
+ - 文件：`Siamese-pytorch-master/my_predict_gui_new1.py`
+ - 框架：Flask
+ - 功能：对两张车辆图片做预处理与裁切，然后分别计算“车头相似度/车尾相似度”，并给出简单分类结果。
+
+ ## 核心流程（服务内部）
+
+ - **车辆裁切预处理**：`data_chuli.cropper.VehicleCropper().process_pil()`
+ - **部位裁切**：使用 YOLO 检测车头/车尾框（`ultralytics.YOLO`）
+   - `cls_id=0`：车头
+   - `cls_id=1`：车尾
+ - **相似度模型**：分别用两套 Siamese 模型计算
+   - 车头：`Siamese(model_path=HEAD_MODEL_PATH)`
+   - 车尾：`Siamese(model_path=TAIL_MODEL_PATH)`
+ - **并发控制**：初始化使用 `_INIT_LOCK`，推理使用 `_INFER_LOCK`，避免多线程并发导致模型状态异常。
+
+ ## 接口说明
+
+ ### `GET /`
+
+ - 返回：可用 endpoints 列表
+
+ ### `GET /health`
+
+ - 返回：`{"status":"ok"}`
+
+ ### `POST /predict`
+
+ - **Content-Type**：`application/json`
+ - **请求体**：
+   - `path1`：图片1的绝对路径
+   - `path2`：图片2的绝对路径
+ - **路径校验规则**：
+   - 必须是绝对路径
+   - 文件必须存在且为图片格式（`.jpg/.jpeg/.png/.bmp/.webp`）
+   - 如果设置了 `ALLOWED_BASE_DIRS`，则路径必须落在白名单目录内
+
+ - **响应字段**：
+   - `ok`：是否推理成功（`case_type != "abnormal"`）
+   - `case_type`：分类结果（见下）
+   - `head_prob`：车头相似度（float）
+   - `tail_prob`：车尾相似度（float）
+   - `error`：异常信息（可选）
+
+ ## 分类规则（`case_type`）
+
+ - `abnormal`
+   - 模型初始化失败或推理异常（如文件打不开、模型路径错误等）
+ - `fake_plate`
+   - `head_prob < HEAD_LOW_TH`（默认 `0.8`）
+ - `change_trailer`
+   - `head_prob > HEAD_SAME_TH`（默认 `0.3`）且 `tail_prob <= TAIL_LOW_TH`（默认 `0.3`）
+ - `normal`
+   - 其余情况
+
+ ## 环境变量配置
+
+ - `HOST`
+   - 默认：`0.0.0.0`
+ - `PORT`
+   - 默认：`8001`
+ - `HEAD_MODEL_PATH`
+   - 车头 Siamese 权重路径
+   - 默认（脚本内置）：`Siamese-pytorch-master/logs/head/1211/best_epoch_weights.pth`
+ - `TAIL_MODEL_PATH`
+   - 车尾 Siamese 权重路径
+   - 默认（脚本内置）：`Siamese-pytorch-master/logs/weibu/1211/best_epoch_weights.pth`
+ - `HEADTAIL_MODEL_PATH`
+   - YOLO 检测模型路径（用于裁切车头/车尾）
+   - 默认（脚本内置）：`D:\data2\runs\detect\train\weights\best.pt`
+ - `ALLOWED_BASE_DIRS`
+   - 图片路径白名单；多个目录用英文分号 `;` 分隔
+   - 示例：`D:\images;D:\dataset\capture`
+ - `HEAD_LOW_TH` / `HEAD_SAME_TH` / `TAIL_LOW_TH`
+   - 分类阈值，默认分别为 `0.8 / 0.3 / 0.3`
+
+ ## 启动方式（Windows 示例）
+
+ - 直接启动（使用脚本默认模型路径）：
+  - `python Siamese-pytorch-master\my_predict_gui_new1.py`
+
+ - 指定端口与模型路径（PowerShell）：
+  - `$env:PORT="8001"; $env:HEAD_MODEL_PATH="D:\\path\\head.pth"; $env:TAIL_MODEL_PATH="D:\\path\\tail.pth"; $env:HEADTAIL_MODEL_PATH="D:\\path\\best.pt"; python Siamese-pytorch-master\my_predict_gui_new1.py`
+
+ ## 调用示例
+
+ - 请求：
+```json
+{
+  "path1": "D:\\images\\a.jpg",
+  "path2": "D:\\images\\b.jpg"
+}
+```
+
+ - 响应示例：
+```json
+{
+  "ok": true,
+  "case_type": "normal",
+  "head_prob": 0.91,
+  "tail_prob": 0.88
+}
