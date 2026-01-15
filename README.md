@@ -90,6 +90,15 @@
  - **[增强] /predict 支持 http(s) 图片链接**
    - 说明：当 `path1/path2` 为 `http(s)://...` 时，服务端先拉取到本地再推理
 
+ - **[新增] 预览推理接口（返回 6 张裁切图）**
+   - 接口：`POST /predict_preview`、`POST /predict_upload_preview`
+   - 返回：在原有 `head_prob/tail_prob/case_type` 基础上增加 `previews`（6 张图的 base64 dataURL）
+
+ - **[增强] /ui 页面简洁改版 + 使用教程**
+   - 标题：`过磅车辆智能识别系统 v4.2`
+   - 风格：白底简洁
+   - 功能：新增“使用教程”弹窗，结果区支持 6 图可视化与概率进度条
+
  # 后端服务（Flask）
 
  ## 服务入口
@@ -143,6 +152,22 @@
    - `file2`：图片2
  - **说明**：适用于远端电脑图片在本机、不在服务器磁盘的场景
 
+ ### `POST /predict_preview`
+
+ - **Content-Type**：`application/json`
+ - **请求体**：同 `/predict`
+ - **返回字段**：同 `/predict`，并额外包含：
+   - `previews`：预览图（base64 dataURL）
+     - `vehicle1` / `vehicle2`：车辆裁切预处理后的图
+     - `head1` / `head2`：车头裁切图
+     - `tail1` / `tail2`：车尾裁切图
+
+ ### `POST /predict_upload_preview`
+
+ - **Content-Type**：`multipart/form-data`
+ - **请求体**：同 `/predict_upload`
+ - **返回字段**：同 `/predict_preview`
+
  - **响应字段**：
    - `ok`：是否推理成功（`case_type != "abnormal"`）
    - `case_type`：分类结果（见下）
@@ -182,6 +207,9 @@
  - `REMOTE_FETCH_ENABLED`
    - 远程拉取开关（当 `/predict` 传入 `http(s)` 链接或本地文件缺失时）
    - 默认：开启（`1`）；关闭示例：`0/false/no/off`
+ - `PREVIEW_MAX_SIZE`
+   - 预览图片最大边长（用于 `/predict_preview` 与 `/predict_upload_preview` 返回的 6 图）
+   - 默认：`640`
  - `HEAD_LOW_TH` / `HEAD_SAME_TH` / `TAIL_LOW_TH`
    - 分类阈值，默认分别为 `0.8 / 0.3 / 0.3`
 
@@ -223,3 +251,5 @@
 
 http://127.0.0.1:8001/ui
 http://198.18.0.1:8001/ui
+![alt text](image.png)
+![alt text](image-1.png)

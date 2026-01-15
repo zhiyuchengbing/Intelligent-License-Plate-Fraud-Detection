@@ -2,6 +2,8 @@ import os
 import sys
 import threading
 import urllib.parse
+import base64
+import io
 from typing import Optional, Tuple, Dict, Any
 
 import numpy as np
@@ -179,6 +181,28 @@ def _bgr_to_pil(bgr: np.ndarray) -> Image.Image:
     return Image.fromarray(rgb)
 
 
+def _preview_max_size() -> int:
+    try:
+        return int(os.environ.get("PREVIEW_MAX_SIZE", "640"))
+    except Exception:
+        return 640
+
+
+def _pil_to_jpeg_data_url(pil_img: Image.Image) -> str:
+    img = pil_img
+    if img is None:
+        return ""
+    img = img.convert("RGB")
+    max_size = _preview_max_size()
+    if max_size > 0:
+        img = img.copy()
+        img.thumbnail((max_size, max_size))
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=85)
+    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    return f"data:image/jpeg;base64,{b64}"
+
+
 def _crop_part_from_vehicle_pil(vehicle_image: Image.Image, cls_id: int) -> Image.Image:
     try:
         if vehicle_image is None:
@@ -256,6 +280,44 @@ def _compute_head_tail_probs(path1: str, path2: str) -> Tuple[Optional[float], O
         return float(head_prob), float(tail_prob), None
     except Exception as e:
         return None, None, str(e)
+
+
+def _compute_probs_and_previews_pil(
+    img1: Image.Image, img2: Image.Image
+) -> Tuple[Optional[float], Optional[float], Optional[Dict[str, str]], Optional[str]]:
+    try:
+        _init_models()
+        if _CROPPER is None or _HEAD_MODEL is None or _TAIL_MODEL is None:
+            return None, None, None, "models not initialized"
+
+        v1 = _CROPPER.process_pil(img1)
+        v2 = _CROPPER.process_pil(img2)
+
+        h1 = _crop_part_from_vehicle_pil(v1, cls_id=0)
+        h2 = _crop_part_from_vehicle_pil(v2, cls_id=0)
+        t1 = _crop_part_from_vehicle_pil(v1, cls_id=1)
+        t2 = _crop_part_from_vehicle_pil(v2, cls_id=1)
+
+        with _INFER_LOCK:
+            head_prob = _HEAD_MODEL.detect_image(h1, h2)
+            tail_prob = _TAIL_MODEL.detect_image(t1, t2)
+
+        if hasattr(head_prob, "item"):
+            head_prob = head_prob.item()
+        if hasattr(tail_prob, "item"):
+            tail_prob = tail_prob.item()
+
+        previews: Dict[str, str] = {
+            "vehicle1": _pil_to_jpeg_data_url(v1),
+            "vehicle2": _pil_to_jpeg_data_url(v2),
+            "head1": _pil_to_jpeg_data_url(h1),
+            "head2": _pil_to_jpeg_data_url(h2),
+            "tail1": _pil_to_jpeg_data_url(t1),
+            "tail2": _pil_to_jpeg_data_url(t2),
+        }
+        return float(head_prob), float(tail_prob), previews, None
+    except Exception as e:
+        return None, None, None, str(e)
 
 
 def _compute_head_tail_probs_pil(img1: Image.Image, img2: Image.Image) -> Tuple[Optional[float], Optional[float], Optional[str]]:
@@ -342,6 +404,69 @@ def predict() -> Any:
         "case_type": case_type,
         "head_prob": head_prob,
         "tail_prob": tail_prob,
+    }
+    if err:
+        resp["error"] = err
+    return jsonify(resp)
+
+
+@app.post("/predict_preview")
+def predict_preview() -> Any:
+    predictor = VehiclePairPredictor()
+    payload = request.get_json(silent=True) or {}
+    ok1, p1 = _validate_image_path(payload.get("path1"))
+    ok2, p2 = _validate_image_path(payload.get("path2"))
+    if not ok1:
+        return jsonify({"ok": False, "error": f"path1 invalid: {p1}"}), 400
+    if not ok2:
+        return jsonify({"ok": False, "error": f"path2 invalid: {p2}"}), 400
+
+    try:
+        img1 = Image.open(p1)
+        img2 = Image.open(p2)
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"failed to open images: {e}"}), 400
+
+    head_prob, tail_prob, previews, err = _compute_probs_and_previews_pil(img1, img2)
+    case_type = predictor.classify(head_prob, tail_prob)
+
+    resp: Dict[str, Any] = {
+        "ok": case_type != "abnormal",
+        "case_type": case_type,
+        "head_prob": head_prob,
+        "tail_prob": tail_prob,
+        "previews": previews or {},
+    }
+    if err:
+        resp["error"] = err
+    return jsonify(resp)
+
+
+@app.post("/predict_upload_preview")
+def predict_upload_preview() -> Any:
+    predictor = VehiclePairPredictor()
+    f1 = request.files.get("file1")
+    f2 = request.files.get("file2")
+    if f1 is None:
+        return jsonify({"ok": False, "error": "file1 missing"}), 400
+    if f2 is None:
+        return jsonify({"ok": False, "error": "file2 missing"}), 400
+
+    try:
+        img1 = Image.open(f1.stream)
+        img2 = Image.open(f2.stream)
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"failed to open images: {e}"}), 400
+
+    head_prob, tail_prob, previews, err = _compute_probs_and_previews_pil(img1, img2)
+    case_type = predictor.classify(head_prob, tail_prob)
+
+    resp: Dict[str, Any] = {
+        "ok": case_type != "abnormal",
+        "case_type": case_type,
+        "head_prob": head_prob,
+        "tail_prob": tail_prob,
+        "previews": previews or {},
     }
     if err:
         resp["error"] = err
