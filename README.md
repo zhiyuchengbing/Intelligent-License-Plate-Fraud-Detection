@@ -55,6 +55,41 @@
  - **结果更新**：覆盖写入默认 CSV（无疑似结果时也覆盖为空表头，避免旧结果残留）。
  - **状态更新**：`last_task_id` 使用本次参与检测数据的最大 `TASK_ID` 更新。
 
+ ## 2026-01-15
+
+ - **[新增] Flask 后端推理服务（两图比对：车头/车尾）**
+   - 文件：`Siamese-pytorch-master/my_predict_gui_new1.py`
+   - 接口：`GET /health`、`POST /predict`
+   - 输出：`head_prob` / `tail_prob` 与 `case_type`
+
+ - **[新增] 图片路径校验与安全控制**
+   - 规则：必须绝对路径、必须存在且是图片扩展名（`.jpg/.jpeg/.png/.bmp/.webp`）
+   - 白名单：支持 `ALLOWED_BASE_DIRS` 限制可访问目录
+
+ - **[新增] 本地缺失文件的远程拉取（可关闭）**
+   - 组件：`data_tran.image_resolver.ImagePathResolver`
+   - 开关：`REMOTE_FETCH_ENABLED`（关闭后本地不存在直接报错）
+
+ - **[新增] 车头/车尾部位裁切**
+   - 方式：YOLO 检测车头/车尾框并裁切最高置信度目标（`cls_id=0` 车头、`cls_id=1` 车尾）
+   - 模型：`HEADTAIL_MODEL_PATH`
+
+ - **[增强] 并发保护**
+   - 初始化：`_INIT_LOCK`
+   - 推理：`_INFER_LOCK`
+
+ - **[新增] Web 前端页面（远端浏览器访问）**
+   - 页面：`GET /ui`
+   - 前端文件：`Siamese-pytorch-master/templates/ui.html`、`Siamese-pytorch-master/static/ui.css`、`Siamese-pytorch-master/static/ui.js`
+   - 功能：支持“路径/链接预测”和“本地上传预测”，并提供结果下载（JSON/CSV）按钮
+
+ - **[新增] 本地上传预测接口（适配远端电脑图片在本机）**
+   - 接口：`POST /predict_upload`（`multipart/form-data`）
+   - 字段：`file1`、`file2`
+
+ - **[增强] /predict 支持 http(s) 图片链接**
+   - 说明：当 `path1/path2` 为 `http(s)://...` 时，服务端先拉取到本地再推理
+
  # 后端服务（Flask）
 
  ## 服务入口
@@ -84,16 +119,29 @@
 
  - 返回：`{"status":"ok"}`
 
+ ### `GET /ui`
+
+ - 返回：Web 前端页面（浏览器访问入口）
+ - 说明：前端静态资源位于 `Siamese-pytorch-master/static/`
+
  ### `POST /predict`
 
  - **Content-Type**：`application/json`
  - **请求体**：
-   - `path1`：图片1的绝对路径
-   - `path2`：图片2的绝对路径
+   - `path1`：图片1的绝对路径或 `http(s)` 图片链接
+   - `path2`：图片2的绝对路径或 `http(s)` 图片链接
  - **路径校验规则**：
-   - 必须是绝对路径
+   - 传入本地路径时：必须是绝对路径
    - 文件必须存在且为图片格式（`.jpg/.jpeg/.png/.bmp/.webp`）
    - 如果设置了 `ALLOWED_BASE_DIRS`，则路径必须落在白名单目录内
+
+ ### `POST /predict_upload`
+
+ - **Content-Type**：`multipart/form-data`
+ - **请求体**：
+   - `file1`：图片1
+   - `file2`：图片2
+ - **说明**：适用于远端电脑图片在本机、不在服务器磁盘的场景
 
  - **响应字段**：
    - `ok`：是否推理成功（`case_type != "abnormal"`）
@@ -131,6 +179,9 @@
  - `ALLOWED_BASE_DIRS`
    - 图片路径白名单；多个目录用英文分号 `;` 分隔
    - 示例：`D:\images;D:\dataset\capture`
+ - `REMOTE_FETCH_ENABLED`
+   - 远程拉取开关（当 `/predict` 传入 `http(s)` 链接或本地文件缺失时）
+   - 默认：开启（`1`）；关闭示例：`0/false/no/off`
  - `HEAD_LOW_TH` / `HEAD_SAME_TH` / `TAIL_LOW_TH`
    - 分类阈值，默认分别为 `0.8 / 0.3 / 0.3`
 
@@ -141,6 +192,13 @@
 
  - 指定端口与模型路径（PowerShell）：
   - `$env:PORT="8001"; $env:HEAD_MODEL_PATH="D:\\path\\head.pth"; $env:TAIL_MODEL_PATH="D:\\path\\tail.pth"; $env:HEADTAIL_MODEL_PATH="D:\\path\\best.pt"; python Siamese-pytorch-master\my_predict_gui_new1.py`
+
+ ## 远端访问注意事项（局域网）
+
+ - 远端电脑访问时不要使用 `127.0.0.1/localhost`，应使用运行服务机器的局域网 IPv4（常见为 `172.*` 或 `10.*`）。
+ - 若远端浏览器一直“连接中”，优先检查：
+   - Windows 防火墙是否放行入站 `TCP 8001`
+   - 远端是否能连通端口：`Test-NetConnection -ComputerName <服务器IP> -Port 8001`
 
  ## 调用示例
 
@@ -160,3 +218,8 @@
   "head_prob": 0.91,
   "tail_prob": 0.88
 }
+
+
+
+http://127.0.0.1:8001/ui
+http://198.18.0.1:8001/ui

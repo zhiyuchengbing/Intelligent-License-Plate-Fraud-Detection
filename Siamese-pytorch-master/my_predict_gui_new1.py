@@ -1,15 +1,17 @@
 import os
 import sys
 import threading
+import urllib.parse
 from typing import Optional, Tuple, Dict, Any
 
 import numpy as np
 import cv2
 from PIL import Image
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, render_template
 from ultralytics import YOLO
 
 from siamese import Siamese
+from data_tran.image_resolver import ImagePathResolver
 
 parent_dir = os.path.dirname(os.path.dirname(__file__))
 if parent_dir not in sys.path:
@@ -27,6 +29,15 @@ _CROPPER: Optional[VehicleCropper] = None
 _HEAD_MODEL: Optional[Siamese] = None
 _TAIL_MODEL: Optional[Siamese] = None
 _HEADTAIL_MODEL: Optional[YOLO] = None
+_IMAGE_RESOLVER: Optional[ImagePathResolver] = None
+
+
+def _is_http_url(s: str) -> bool:
+    try:
+        u = urllib.parse.urlparse(s)
+        return u.scheme in {"http", "https"} and bool(u.netloc)
+    except Exception:
+        return False
 
 
 def _get_allowed_base_dirs() -> Tuple[str, ...]:
@@ -51,26 +62,83 @@ def _is_path_allowed(path: str) -> bool:
         return False
 
 
+def _remote_fetch_enabled() -> bool:
+    raw = str(os.environ.get("REMOTE_FETCH_ENABLED", "1")).strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
 def _validate_image_path(p: Any) -> Tuple[bool, Optional[str]]:
+    global _IMAGE_RESOLVER
     if not isinstance(p, str) or not p.strip():
         return False, "path must be a non-empty string"
-    abs_path = os.path.abspath(p)
-    if not os.path.isabs(abs_path):
+
+    raw = p.strip()
+    if _is_http_url(raw):
+        if not _remote_fetch_enabled():
+            raw_flag = str(os.environ.get("REMOTE_FETCH_ENABLED", "1")).strip()
+            return False, f"remote fetch disabled: REMOTE_FETCH_ENABLED={raw_flag}"
+        if _IMAGE_RESOLVER is None:
+            _IMAGE_RESOLVER = ImagePathResolver()
+        print(f"[predict] try remote fetch: {raw}")
+        ok, local_path, err = _IMAGE_RESOLVER.fetch_to_local(raw)
+        if not ok or not local_path:
+            return False, f"remote fetch failed: {err}"
+        abs_path = os.path.abspath(local_path)
+        if not _is_path_allowed(abs_path):
+            return False, "path not allowed"
+        if not os.path.exists(abs_path) or not os.path.isfile(abs_path):
+            return False, "file not found after remote fetch"
+        ext = os.path.splitext(abs_path)[1].lower()
+        if ext not in {".jpg", ".jpeg", ".png", ".bmp", ".webp"}:
+            return False, "unsupported file extension"
+        return True, abs_path
+
+    if not os.path.isabs(raw):
         return False, "path must be absolute"
+    abs_path = os.path.abspath(raw)
     if not _is_path_allowed(abs_path):
         return False, "path not allowed"
-    if not os.path.exists(abs_path):
-        return False, "file not found"
+
     if not os.path.isfile(abs_path):
-        return False, "path is not a file"
+        if os.path.exists(abs_path):
+            return False, "path is not a file"
     ext = os.path.splitext(abs_path)[1].lower()
     if ext not in {".jpg", ".jpeg", ".png", ".bmp", ".webp"}:
         return False, "unsupported file extension"
+
+    if not os.path.exists(abs_path):
+        if _remote_fetch_enabled():
+            if _IMAGE_RESOLVER is None:
+                _IMAGE_RESOLVER = ImagePathResolver()
+            print(f"[predict] local file missing, try remote fetch: {p}")
+            ok, local_path, err = _IMAGE_RESOLVER.fetch_to_local(p)
+            if ok and local_path:
+                abs_path = os.path.abspath(local_path)
+                if not _is_path_allowed(abs_path):
+                    return False, "path not allowed"
+                if os.path.exists(abs_path) and os.path.isfile(abs_path):
+                    return True, abs_path
+                return False, "file not found after remote fetch"
+            return False, f"file not found (remote fetch failed: {err})"
+        raw_flag = str(os.environ.get("REMOTE_FETCH_ENABLED", "1")).strip()
+        return False, f"file not found (remote fetch disabled: REMOTE_FETCH_ENABLED={raw_flag})"
+
     return True, abs_path
 
 
+class VehiclePairPredictor:
+    def predict_from_paths(self, path1: str, path2: str) -> Tuple[Optional[float], Optional[float], Optional[str]]:
+        return _compute_head_tail_probs(path1, path2)
+
+    def predict_from_pil(self, img1: Image.Image, img2: Image.Image) -> Tuple[Optional[float], Optional[float], Optional[str]]:
+        return _compute_head_tail_probs_pil(img1, img2)
+
+    def classify(self, head_prob: Optional[float], tail_prob: Optional[float]) -> str:
+        return _classify_case(head_prob, tail_prob)
+
+
 def _init_models() -> None:
-    global _INITIALIZED, _CROPPER, _HEAD_MODEL, _TAIL_MODEL, _HEADTAIL_MODEL
+    global _INITIALIZED, _CROPPER, _HEAD_MODEL, _TAIL_MODEL, _HEADTAIL_MODEL, _IMAGE_RESOLVER
     if _INITIALIZED:
         return
     with _INIT_LOCK:
@@ -94,6 +162,8 @@ def _init_models() -> None:
         _HEAD_MODEL = Siamese(model_path=head_model_path)
         _TAIL_MODEL = Siamese(model_path=tail_model_path)
         _HEADTAIL_MODEL = YOLO(headtail_model_path)
+        if _IMAGE_RESOLVER is None:
+            _IMAGE_RESOLVER = ImagePathResolver()
 
         _INITIALIZED = True
 
@@ -188,6 +258,34 @@ def _compute_head_tail_probs(path1: str, path2: str) -> Tuple[Optional[float], O
         return None, None, str(e)
 
 
+def _compute_head_tail_probs_pil(img1: Image.Image, img2: Image.Image) -> Tuple[Optional[float], Optional[float], Optional[str]]:
+    try:
+        _init_models()
+        if _CROPPER is None or _HEAD_MODEL is None or _TAIL_MODEL is None:
+            return None, None, "models not initialized"
+
+        img1 = _CROPPER.process_pil(img1)
+        img2 = _CROPPER.process_pil(img2)
+
+        head1 = _crop_part_from_vehicle_pil(img1, cls_id=0)
+        head2 = _crop_part_from_vehicle_pil(img2, cls_id=0)
+        tail1 = _crop_part_from_vehicle_pil(img1, cls_id=1)
+        tail2 = _crop_part_from_vehicle_pil(img2, cls_id=1)
+
+        with _INFER_LOCK:
+            head_prob = _HEAD_MODEL.detect_image(head1, head2)
+            tail_prob = _TAIL_MODEL.detect_image(tail1, tail2)
+
+        if hasattr(head_prob, "item"):
+            head_prob = head_prob.item()
+        if hasattr(tail_prob, "item"):
+            tail_prob = tail_prob.item()
+
+        return float(head_prob), float(tail_prob), None
+    except Exception as e:
+        return None, None, str(e)
+
+
 def _classify_case(head_prob: Optional[float], tail_prob: Optional[float]) -> str:
     if head_prob is None or tail_prob is None:
         return "abnormal"
@@ -205,7 +303,19 @@ def _classify_case(head_prob: Optional[float], tail_prob: Optional[float]) -> st
 
 @app.get("/")
 def index() -> Any:
-    return jsonify({"endpoints": {"health": "/health", "predict": "/predict"}})
+    return jsonify({
+        "endpoints": {
+            "health": "/health",
+            "predict": "/predict",
+            "predict_upload": "/predict_upload",
+            "ui": "/ui",
+        }
+    })
+
+
+@app.get("/ui")
+def ui() -> Any:
+    return render_template("ui.html")
 
 
 @app.get("/health")
@@ -215,6 +325,7 @@ def health() -> Any:
 
 @app.post("/predict")
 def predict() -> Any:
+    predictor = VehiclePairPredictor()
     payload = request.get_json(silent=True) or {}
     ok1, p1 = _validate_image_path(payload.get("path1"))
     ok2, p2 = _validate_image_path(payload.get("path2"))
@@ -223,8 +334,38 @@ def predict() -> Any:
     if not ok2:
         return jsonify({"ok": False, "error": f"path2 invalid: {p2}"}), 400
 
-    head_prob, tail_prob, err = _compute_head_tail_probs(p1, p2)
-    case_type = _classify_case(head_prob, tail_prob)
+    head_prob, tail_prob, err = predictor.predict_from_paths(p1, p2)
+    case_type = predictor.classify(head_prob, tail_prob)
+
+    resp: Dict[str, Any] = {
+        "ok": case_type != "abnormal",
+        "case_type": case_type,
+        "head_prob": head_prob,
+        "tail_prob": tail_prob,
+    }
+    if err:
+        resp["error"] = err
+    return jsonify(resp)
+
+
+@app.post("/predict_upload")
+def predict_upload() -> Any:
+    predictor = VehiclePairPredictor()
+    f1 = request.files.get("file1")
+    f2 = request.files.get("file2")
+    if f1 is None:
+        return jsonify({"ok": False, "error": "file1 missing"}), 400
+    if f2 is None:
+        return jsonify({"ok": False, "error": "file2 missing"}), 400
+
+    try:
+        img1 = Image.open(f1.stream)
+        img2 = Image.open(f2.stream)
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"failed to open images: {e}"}), 400
+
+    head_prob, tail_prob, err = predictor.predict_from_pil(img1, img2)
+    case_type = predictor.classify(head_prob, tail_prob)
 
     resp: Dict[str, Any] = {
         "ok": case_type != "abnormal",
